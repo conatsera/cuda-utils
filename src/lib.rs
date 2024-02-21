@@ -32,7 +32,6 @@ macro_rules! check_cuda {
     };
 }
 
-#[derive(Debug)]
 pub struct CudaKernel {
     module: CUmodule,
     function: CUfunction,
@@ -458,6 +457,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs generated/test assets"]
     fn test_cuda_jpeg_file_decode() {
         let mut test_cuda = Cuda::new();
         test_cuda.setup_kernels();
