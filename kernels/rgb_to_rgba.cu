@@ -10,21 +10,24 @@ __global__ void rgb_to_rgba_shift_segment(unsigned char* __restrict__ image_byte
 }
 __global__ void rgb_to_rgba_shift_segment_final(unsigned char* __restrict__ image_bytes) {
     const unsigned int index = threadIdx.x;
-    const unsigned int rgba_base_addr = index * 4;
     const unsigned int rgb_base_addr = index * 3;
 
-    char temp_byte_buffer[4096];
+    char temp_byte_buffer[3];
 
-    temp_byte_buffer[rgba_base_addr] = image_bytes[rgb_base_addr];
-    temp_byte_buffer[rgba_base_addr+1] = image_bytes[rgb_base_addr+1];
-    temp_byte_buffer[rgba_base_addr+2] = image_bytes[rgb_base_addr+2];
+    temp_byte_buffer[0] = image_bytes[rgb_base_addr];
+    temp_byte_buffer[1] = image_bytes[rgb_base_addr+1];
+    temp_byte_buffer[2] = image_bytes[rgb_base_addr+2];
 
     __syncthreads();
 
-    image_bytes[rgba_base_addr] = temp_byte_buffer[rgba_base_addr];
-    image_bytes[rgba_base_addr+1] = temp_byte_buffer[rgba_base_addr+1];
-    image_bytes[rgba_base_addr+2] = temp_byte_buffer[rgba_base_addr+2];
+    const unsigned int rgba_base_addr = index * 4;
+    image_bytes[rgba_base_addr] = temp_byte_buffer[0];
+    image_bytes[rgba_base_addr+1] = temp_byte_buffer[1];
+    image_bytes[rgba_base_addr+2] = temp_byte_buffer[2];
     image_bytes[rgba_base_addr+3] = 0;
+}
+extern "C" __global__ void rgb_to_rgba_single_pass(unsigned long* __restrict__ image, unsigned int pitch, unsigned int size) {
+    
 }
 extern "C" __global__ void rgb_to_rgba(unsigned long* __restrict__ image, unsigned int pitch, unsigned int size) {
     unsigned char* __restrict__ image_bytes = (unsigned char*) image;
