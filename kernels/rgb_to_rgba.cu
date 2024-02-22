@@ -28,49 +28,16 @@ struct BlockMove {
         ) : size(size), block_size(block_size), position(position) {}
 };
 extern "C" __global__ void rgb_to_rgba(
-        unsigned long* __restrict__ image,
+        unsigned char* __restrict__ image_bytes,
         const __grid_constant__ unsigned int block_move_count,
         const __grid_constant__ unsigned int final_position,
         const BlockMove *const __restrict__ block_moves
     ) {
-    unsigned char* __restrict__ image_bytes = (unsigned char*) image;
-
     #pragma unroll 64
     for (int i = 0; i < block_move_count; i++) {
-        rgb_to_rgba_shift_segment<<<block_moves[i].size / block_moves[i].block_size, block_moves[i].block_size>>>(image_bytes, block_moves[i].position);
+        const unsigned int block_size = block_moves[i].block_size;
+        rgb_to_rgba_shift_segment<<<block_moves[i].size / block_size, block_size>>>(image_bytes, block_moves[i].position);
     }
 
     rgb_to_rgba_shift_segment_final<<<1, final_position>>>(image_bytes);
 }
-
-/*
-printf("%u %u\n", position, free_segment_size);
-while (free_segment_size > 0) {
-    //printf("%u %u\n", block_size, free_segment_size);
-    rgb_to_rgba_shift_segment<<<free_segment_size, 1>>>(image_bytes, position);
-    free_segment_size /= 4;
-    free_segment_size *= 3;
-    position -= free_segment_size;
-}
-
-
-for (int i = 1024; i > 1; i >>= 1) {
-    
-    if (free_segment_size % i == 0) {
-        rgb_to_rgba_shift_segment<<<free_segment_size / i, i>>>(image_bytes, position);
-        free_segment_size /= 4;
-        free_segment_size *= 3;
-        position -= free_segment_size;
-        i = 2048;
-    }
-}
-
-for (int i = 1024; i > 0; i--) {
-    while (free_segment_size > 0 && free_segment_size % i == 0) {
-        rgb_to_rgba_shift_segment<<<free_segment_size / i, i>>>(image_bytes, position);
-        free_segment_size /= 4;
-        free_segment_size *= 3;
-        position -= free_segment_size;
-    }
-}
-*/
