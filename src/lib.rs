@@ -98,19 +98,21 @@ impl BlockMove {
 
 const fn calculate_optimal_block_size(size: u32) -> u32 {
     let pow2_divisor = size.trailing_zeros();
-    if pow2_divisor > 10 {
-        return 1024;
-    }
-    if pow2_divisor != 10 {
-        let mut i = 1023;
-        while i > 0 {
-            if size % i == 0 {
-                return i;
+    assert!(pow2_divisor ==  size.reverse_bits().leading_zeros());
+    match pow2_divisor {
+        0..=1 => {
+            let mut i = 1023;
+            while i > 0 {
+                if size % i == 0 {
+                    return i;
+                }
+                i-=1;
             }
-            i-=1;
-        }
+            i
+        },
+        2..=9 => 1 << pow2_divisor,
+        _ => 1024
     }
-    1_u32 << pow2_divisor
 }
 
 const fn generate_free_segment_block_moves(size: u32) -> (u32, u32, [BlockMove; 64]) {
@@ -124,6 +126,7 @@ const fn generate_free_segment_block_moves(size: u32) -> (u32, u32, [BlockMove; 
             block_size: calculate_optimal_block_size(free_segment_size),
             position
         };
+        assert!(block_move_sequence[sequence_num as usize].size % block_move_sequence[sequence_num as usize].block_size == 0);
         sequence_num+=1;
         free_segment_size /= 4;
         free_segment_size *= 3;
@@ -304,19 +307,10 @@ impl Cuda {
         }
     }
 
-    pub fn rgb_to_rgba_cuda(&mut self, size: u32, image_device_addr: *mut c_void) {
-        let image_size_index = DEFAULT_IMAGE_SIZES.into_iter().position(|s| s == size as usize).unwrap();
-        let block_moves = self.block_move_sequence_buffers[image_size_index];
-        let mut block_moves_device = self.create_global_buffer(
-            &block_moves.2 as *const BlockMove as *mut c_void,
-            block_moves.0 as usize * std::mem::size_of::<BlockMove>()
-        );
-        
-        let mut args: [*mut c_void; 4] = [
+    #[inline]
+    pub fn rgb_to_rgba_cuda(&mut self, _size: u32, image_device_addr: *mut c_void) {        
+        let mut args: [*mut c_void; 1] = [
             image_device_addr,
-            &self.block_move_sequence_buffers[image_size_index].0 as *const u32 as *const c_void as *mut c_void,
-            &self.block_move_sequence_buffers[image_size_index].1 as *const u32 as *const c_void as *mut c_void,
-            &mut block_moves_device as *mut u64 as *mut c_void,
         ];
         self.launch_kernel(
             "rgb_to_rgba",
@@ -487,7 +481,6 @@ mod tests {
             }
         }
     }
-
 
     #[test]
     fn test_pattern_cuda_rgb_to_rgba() {
