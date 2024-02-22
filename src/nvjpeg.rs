@@ -9,6 +9,15 @@ macro_rules! check_nvjpeg {
     };
 }
 
+macro_rules! check_nvjpeg_no_panic {
+    ($($nvjpegCommandArgs:tt)*) => {
+        let status = unsafe { $($nvjpegCommandArgs)* };
+        if status != nvjpegStatus_t_NVJPEG_STATUS_SUCCESS {
+            println!("{} failed. status = {}", stringify!($($nvjpegCommandArgs)*), status);
+        }
+    };
+}
+
 pub struct Decoder {
     handle: nvjpegHandle_t,
     state: nvjpegJpegState_t,
@@ -36,16 +45,16 @@ pub struct ExtImage {
 
 impl Decoder {
     pub fn destroy(&mut self) {
-        check_nvjpeg!(nvjpegDecodeParamsDestroy(self.decode_params));
-        check_nvjpeg!(nvjpegJpegStreamDestroy(self.streams[0]));
-        check_nvjpeg!(nvjpegJpegStreamDestroy(self.streams[1]));
-        check_nvjpeg!(nvjpegBufferPinnedDestroy(self.host_buffers[0]));
-        check_nvjpeg!(nvjpegBufferPinnedDestroy(self.host_buffers[1]));
-        check_nvjpeg!(nvjpegBufferDeviceDestroy(self.device_buffer));
-        check_nvjpeg!(nvjpegJpegStateDestroy(self.decoder_state));
-        check_nvjpeg!(nvjpegDecoderDestroy(self.decoder));
-        check_nvjpeg!(nvjpegJpegStateDestroy(self.state));
-        check_nvjpeg!(nvjpegDestroy(self.handle));
+        check_nvjpeg_no_panic!(nvjpegDecodeParamsDestroy(self.decode_params));
+        check_nvjpeg_no_panic!(nvjpegJpegStreamDestroy(self.streams[0]));
+        check_nvjpeg_no_panic!(nvjpegJpegStreamDestroy(self.streams[1]));
+        check_nvjpeg_no_panic!(nvjpegBufferPinnedDestroy(self.host_buffers[0]));
+        check_nvjpeg_no_panic!(nvjpegBufferPinnedDestroy(self.host_buffers[1]));
+        check_nvjpeg_no_panic!(nvjpegBufferDeviceDestroy(self.device_buffer));
+        check_nvjpeg_no_panic!(nvjpegJpegStateDestroy(self.decoder_state));
+        check_nvjpeg_no_panic!(nvjpegDecoderDestroy(self.decoder));
+        check_nvjpeg_no_panic!(nvjpegJpegStateDestroy(self.state));
+        check_nvjpeg_no_panic!(nvjpegDestroy(self.handle));
     }
     pub fn new() -> Self {
         let mut dev_allocator = nvjpegDevAllocator_t {

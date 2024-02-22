@@ -32,6 +32,15 @@ macro_rules! check_cuda {
     };
 }
 
+macro_rules! check_cuda_no_panic {
+    ($($cudaCommandArgs:tt)*) => {
+        let status = unsafe { $($cudaCommandArgs)* };
+        if status != cudaError_cudaSuccess {
+            println!("{} failed. status = {}", stringify!($($cudaCommandArgs)*), status);
+        }
+    };
+}
+
 pub struct CudaKernel {
     module: CUmodule,
     function: CUfunction,
@@ -40,28 +49,105 @@ pub struct CudaKernel {
 
 impl CudaKernel {
     fn destroy(&mut self) {
-        check_cuda!(cuModuleUnload(self.module));
-        check_cuda!(cuLinkDestroy(self.link_state));
+        check_cuda_no_panic!(cuModuleUnload(self.module));
+        check_cuda_no_panic!(cuLinkDestroy(self.link_state));
     }
 }
 
 pub struct Cuda {
     nvjpeg: nvjpeg::Decoder,
     cuda_kernels: HashMap<&'static str, CudaKernel>,
-    cuda_device: CUdevice,
+    allocations: Vec<CUdeviceptr_v2>,
+    cached_allocs: HashMap<&'static *const c_void, CUdeviceptr_v2>,
+    _cuda_device: CUdevice,
     cuda_device_props: cudaDeviceProp,
     cuda_context: CUcontext,
 
     cuda_stream: cudaStream_t,
+
+    block_move_sequence_buffers: [(u32, u32, [BlockMove; 64]); 5],
 }
 
 impl Drop for Cuda {
     fn drop(&mut self) {
-        check_cuda!(cudaStreamDestroy(self.cuda_stream));
-        self.nvjpeg.destroy();
+        check_cuda_no_panic!(cudaStreamDestroy(self.cuda_stream));
+        self.allocations.iter().for_each(|dptr| { check_cuda_no_panic!(cuMemFree_v2(*dptr)); });
         self.cuda_kernels.values_mut().for_each(|k| k.destroy());
-        check_cuda!(cuCtxDestroy_v2(self.cuda_context));
+        self.nvjpeg.destroy();
+        check_cuda_no_panic!(cuCtxDestroy_v2(self.cuda_context));
     }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct BlockMove {
+    size: u32,
+    block_size: u32,
+    position: u32,
+}
+
+impl BlockMove {
+    const fn default() -> Self {
+        BlockMove {
+            size: 0,
+            block_size: 0,
+            position: 0,
+        }
+    }
+}
+
+const fn calculate_optimal_block_size(size: u32) -> u32 {
+    let pow2_divisor = size.trailing_zeros();
+    if pow2_divisor > 10 {
+        return 1024;
+    }
+    if pow2_divisor != 10 {
+        let mut i = 1023;
+        while i > 0 {
+            if size % i == 0 {
+                return i;
+            }
+            i-=1;
+        }
+    }
+    1_u32 << pow2_divisor
+}
+
+const fn generate_free_segment_block_moves(size: u32) -> (u32, u32, [BlockMove; 64]) {
+    let mut block_move_sequence = [BlockMove::default(); 64];
+    let mut free_segment_size = size / 4;
+    let mut position = size - free_segment_size;
+    let mut sequence_num = 0;
+    while free_segment_size > 0 && sequence_num < 64 {
+        block_move_sequence[sequence_num as usize] = BlockMove{
+            size: free_segment_size,
+            block_size: calculate_optimal_block_size(free_segment_size),
+            position
+        };
+        sequence_num+=1;
+        free_segment_size /= 4;
+        free_segment_size *= 3;
+        position -= free_segment_size;
+    }
+    (sequence_num, position, block_move_sequence)
+}
+
+const DEFAULT_IMAGE_SIZES: [usize; 5] = [
+    4096*3072,
+    2048*1536,
+    3840*2160,
+    2560*1440,
+    1920*1080
+];
+
+const fn generate_builtin_block_sizes() -> [(u32, u32, [BlockMove; 64]); 5] {
+    let mut block_moves = [(0, 0, [BlockMove::default(); 64]); 5];
+    let mut size_count = 0;
+    while size_count < 5 {
+        block_moves[size_count] = generate_free_segment_block_moves(DEFAULT_IMAGE_SIZES[size_count] as u32);
+        size_count+=1;
+    }
+    block_moves
 }
 
 impl Cuda {
@@ -81,13 +167,38 @@ impl Cuda {
             &mut cuda_stream,
             cudaStreamNonBlocking
         ));
+        
         Self {
+            allocations: Vec::new(),
             nvjpeg: nvjpeg::Decoder::new(),
             cuda_kernels: HashMap::new(),
-            cuda_device,
+            cached_allocs: HashMap::new(),
+            _cuda_device: cuda_device,
             cuda_device_props,
             cuda_context,
             cuda_stream,
+            block_move_sequence_buffers: generate_builtin_block_sizes(),
+        }
+    }
+
+    pub fn allocate(&mut self, device_addr: &mut CUdeviceptr, byte_size: usize) {
+        check_cuda!(cuMemAlloc_v2(device_addr, byte_size));
+        self.allocations.push(*device_addr);
+    }
+
+    pub fn create_global_buffer(&mut self, host_buffer: *const c_void, byte_size: usize) -> CUdeviceptr {
+        // cursed caching based on host_buffer address. This might not be a good idea but it works
+        if let Some(device_addr) = self.cached_allocs.get(&host_buffer) {
+            *device_addr
+        } else {
+            let mut device_addr: CUdeviceptr = 0;
+            self.allocate(&mut device_addr, byte_size);
+            check_cuda!(cuMemcpyHtoD_v2(
+                device_addr,
+                host_buffer,
+                byte_size
+            ));
+            device_addr
         }
     }
 
@@ -187,6 +298,32 @@ impl Cuda {
         }
     }
 
+    pub fn rgb_to_rgba_cuda(&mut self, size: u32, image_device_addr: *mut c_void) {
+        let image_size_index = DEFAULT_IMAGE_SIZES.into_iter().position(|s| s == size as usize).unwrap();
+        let block_moves = self.block_move_sequence_buffers[image_size_index];
+        let mut block_moves_device = self.create_global_buffer(
+            &block_moves.2 as *const BlockMove as *mut c_void,
+            block_moves.0 as usize * std::mem::size_of::<BlockMove>()
+        );
+        
+        let mut args: [*mut c_void; 4] = [
+            image_device_addr,
+            &self.block_move_sequence_buffers[image_size_index].0 as *const u32 as *const c_void as *mut c_void,
+            &self.block_move_sequence_buffers[image_size_index].1 as *const u32 as *const c_void as *mut c_void,
+            &mut block_moves_device as *mut u64 as *mut c_void,
+        ];
+        self.launch_kernel(
+            "rgb_to_rgba",
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            &mut args as *mut *mut c_void,
+        );
+    }
+
     pub fn decode_image(&self, jpeg_buffer: &[u8], ext_image_out: &mut nvjpeg::ExtImage) {
         self.nvjpeg
             .decode_image(jpeg_buffer, ext_image_out, self.cuda_stream);
@@ -235,8 +372,9 @@ impl Cuda {
 
         let ptx_ver = CString::new(format!("-arch=sm_{}0", self.get_ptx_version())).unwrap();
         let enable_rdx = CString::new("-rdc=true").unwrap();
-        let nvrtc_args = [ptx_ver.as_ptr(), enable_rdx.as_ptr()];
-        let compile_result = unsafe { nvrtcCompileProgram(cuda_program, 2, nvrtc_args.as_ptr()) };
+        let reg_mem_usage_report = CString::new("--ptxas-options=-v").unwrap();
+        let nvrtc_args = [ptx_ver.as_ptr(), enable_rdx.as_ptr(), reg_mem_usage_report.as_ptr()];
+        let compile_result = unsafe { nvrtcCompileProgram(cuda_program, 3, nvrtc_args.as_ptr()) };
 
         let mut log_size: usize = 0;
         check_nvrtc!(nvrtcGetProgramLogSize(cuda_program, &mut log_size));
@@ -334,17 +472,6 @@ pub struct RgbToRgbaArgs {
     stage: u8,
 }
 
-const pattern_generation_kernel: &str = stringify!(
-    extern "C" __global__ void generate_address_pattern() {
-        const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
-        const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
-    }
-    extern "C" __global__ void generate_address_pattern() {
-        const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
-        const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
-    }
-);
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,36 +484,30 @@ mod tests {
         }
     }
 
+
     #[test]
-    fn test_cuda_rgb_to_rgba() {
+    fn test_pattern_cuda_rgb_to_rgba() {
         let mut test_cuda = Cuda::new();
         test_cuda.setup_kernels();
 
-        const pitch: u32 = 4096_u32;
+        const width: u32 = 4096_u32;
         const height: u32 = 3072_u32;
-        const size: u32 = pitch * height;
+        const size: u32 = width * height;
         const rgb_byte_size: usize = size as usize * 3;
         const rgba_byte_size: usize = size as usize * 4;
-        const pitch_addr: *const c_void = &pitch as *const u32 as *const c_void;
-        const size_addr: *const c_void = &size as *const u32 as *const c_void;
 
         let mut image_device_addr: CUdeviceptr = 0;
-        check_cuda!(cuMemAlloc_v2(&mut image_device_addr, rgba_byte_size));
+        test_cuda.allocate(&mut image_device_addr, rgba_byte_size);
 
         let mut test_pattern_image_vec = Vec::with_capacity(rgba_byte_size);
         test_pattern_image_vec.resize(rgba_byte_size, 0);
         generate_test_pattern_byte_increment(&mut test_pattern_image_vec, rgb_byte_size);
+        let test_pattern_image_vec = test_pattern_image_vec;
         check_cuda!(cuMemcpyHtoD_v2(
             image_device_addr,
             test_pattern_image_vec.as_ptr() as *const c_void,
             rgba_byte_size
         ));
-
-        let mut args: [*mut c_void; 3] = [
-            &mut image_device_addr as *mut u64 as *mut c_void,
-            pitch_addr.cast_mut(),
-            size_addr.cast_mut(),
-        ];
 
         let mut startTestEvent: cudaEvent_t = std::ptr::null_mut();
         let mut stopTestEvent: cudaEvent_t = std::ptr::null_mut();
@@ -401,57 +522,47 @@ mod tests {
             cudaEventBlockingSync
         ));
 
-        check_cuda!(cudaEventRecord(startTestEvent, test_cuda.cuda_stream));
-        test_cuda.launch_kernel(
-            "rgb_to_rgba",
-            1,
-            1,
-            1,
-            1,
-            1,
-            1,
-            &mut args as *mut *mut c_void,
-        );
-        check_cuda!(cudaEventRecord(stopTestEvent, test_cuda.cuda_stream));
+        for _ in 0..30 {
+            check_cuda!(cuMemcpyHtoD_v2(
+                image_device_addr,
+                test_pattern_image_vec.as_ptr() as *const c_void,
+                rgba_byte_size
+            ));
+            check_cuda!(cudaEventRecord(startTestEvent, test_cuda.cuda_stream));
+            test_cuda.rgb_to_rgba_cuda(size, &mut image_device_addr as *mut u64 as *mut c_void);
+            check_cuda!(cudaEventRecord(stopTestEvent, test_cuda.cuda_stream));
 
-        check_cuda!(cudaEventSynchronize(stopTestEvent));
-        check_cuda!(cudaEventElapsedTime(
-            &mut testTime,
-            startTestEvent,
-            stopTestEvent
-        ));
+            check_cuda!(cudaEventSynchronize(stopTestEvent));
+            check_cuda!(cudaEventElapsedTime(
+                &mut testTime,
+                startTestEvent,
+                stopTestEvent
+            ));
+            dbg!(testTime);
+        
+            let mut test_result_image_vec = Vec::with_capacity(rgba_byte_size);
+            test_result_image_vec.resize(rgba_byte_size, 0_u8);
+            check_cuda!(cuMemcpyDtoH_v2(
+                test_result_image_vec.as_mut_ptr() as *mut c_void,
+                image_device_addr,
+                rgba_byte_size
+            ));
 
-        dbg!(testTime);
-
-        check_cuda!(cuCtxSynchronize());
-        check_cuda!(cuStreamSynchronize(test_cuda.cuda_stream));
-        check_cuda!(cudaDeviceSynchronize());
-
-        let mut test_result_image_vec = Vec::with_capacity(rgba_byte_size);
-        test_result_image_vec.resize(rgba_byte_size, 0_u8);
-        check_cuda!(cuMemcpyDtoH_v2(
-            test_result_image_vec.as_mut_ptr() as *mut c_void,
-            image_device_addr,
-            rgba_byte_size
-        ));
-
-        // TODO: move to Cuda
-        check_cuda!(cuMemFree_v2(image_device_addr));
-
-        let mut index = rgb_byte_size;
-        for (pos, byte) in test_result_image_vec.into_iter().enumerate().rev() {
-            //println!("{:x} {:x} {:x} {:x} {:x}", pos, rgba_byte_size - 1 - pos, byte, index - 1, *test_pattern_image_vec.get(index - 1).unwrap());
-            if pos % 4 == 3 {
-                assert_eq!(byte, 0, "pattern mismatch @ {}", pos / 4);
-            } else {
-                index -= 1;
-                assert_eq!(
-                    byte,
-                    *test_pattern_image_vec.get(index).unwrap(),
-                    "pattern mismatch @ {}, pattern_index: {}",
-                    pos / 4,
-                    index
-                );
+            let mut index = rgb_byte_size;
+            for (pos, byte) in test_result_image_vec.into_iter().enumerate().rev() {
+                //println!("{:x} {:x} {:x} {:x} {:x}", pos, rgba_byte_size - 1 - pos, byte, index - 1, *test_pattern_image_vec.get(index - 1).unwrap());
+                if pos % 4 == 3 {
+                    assert_eq!(byte, 0, "pattern mismatch @ {}", pos / 4);
+                } else {
+                    index -= 1;
+                    assert_eq!(
+                        byte,
+                        *test_pattern_image_vec.get(index).unwrap(),
+                        "pattern mismatch @ {}, pattern_index: {}",
+                        pos / 4,
+                        index
+                    );
+                }
             }
         }
     }
@@ -516,11 +627,10 @@ mod tests {
 
             check_cuda!(cudaEventRecord(startEvent, std::ptr::null_mut()));
             while stage_num >= 4 {
-                stage_num += 1;
                 test_cuda.launch_kernel(
                     "rgb_to_rgba",
-                    4096,
-                    3072,
+                    1,
+                    1,
                     1,
                     1,
                     1,
