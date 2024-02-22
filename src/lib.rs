@@ -150,6 +150,12 @@ const fn generate_builtin_block_sizes() -> [(u32, u32, [BlockMove; 64]); 5] {
     block_moves
 }
 
+impl Default for Cuda {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Cuda {
     pub fn new() -> Self {
         check_cuda!(cuInit(0));
@@ -165,7 +171,7 @@ impl Cuda {
         let mut cuda_stream: cudaStream_t = std::ptr::null_mut();
         check_cuda!(cudaStreamCreateWithFlags(
             &mut cuda_stream,
-            cudaStreamNonBlocking
+            0
         ));
         
         Self {
@@ -221,7 +227,7 @@ impl Cuda {
             ));
         }
 
-        if ext_image_out.cuda_ext_mem != std::ptr::null_mut() {
+        if !ext_image_out.cuda_ext_mem.is_null() {
             check_cuda!(cudaDestroyExternalMemory(ext_image_out.cuda_ext_mem));
         }
     }
@@ -380,8 +386,7 @@ impl Cuda {
         check_nvrtc!(nvrtcGetProgramLogSize(cuda_program, &mut log_size));
 
         if log_size > 1 {
-            let mut log_string_bytes = Vec::with_capacity(log_size);
-            log_string_bytes.resize(log_size, 0);
+            let mut log_string_bytes = vec![0; log_size];
             check_nvrtc!(nvrtcGetProgramLog(
                 cuda_program,
                 log_string_bytes.as_mut_ptr()
@@ -393,8 +398,7 @@ impl Cuda {
         let mut ptx_size: usize = 0;
         check_nvrtc!(nvrtcGetPTXSize(cuda_program, &mut ptx_size));
 
-        let mut ptx_bytes = Vec::with_capacity(ptx_size);
-        ptx_bytes.resize(ptx_size, 0);
+        let mut ptx_bytes = vec![0; ptx_size];
         check_nvrtc!(nvrtcGetPTX(cuda_program, ptx_bytes.as_mut_ptr()));
 
         check_nvrtc!(nvrtcDestroyProgram(&mut cuda_program));
@@ -499,8 +503,7 @@ mod tests {
         let mut image_device_addr: CUdeviceptr = 0;
         test_cuda.allocate(&mut image_device_addr, rgba_byte_size);
 
-        let mut test_pattern_image_vec = Vec::with_capacity(rgba_byte_size);
-        test_pattern_image_vec.resize(rgba_byte_size, 0);
+        let mut test_pattern_image_vec = vec![0; rgba_byte_size];
         generate_test_pattern_byte_increment(&mut test_pattern_image_vec, rgb_byte_size);
         let test_pattern_image_vec = test_pattern_image_vec;
         check_cuda!(cuMemcpyHtoD_v2(
@@ -522,7 +525,7 @@ mod tests {
             cudaEventBlockingSync
         ));
 
-        for _ in 0..30 {
+        for _ in 0..300 {
             check_cuda!(cuMemcpyHtoD_v2(
                 image_device_addr,
                 test_pattern_image_vec.as_ptr() as *const c_void,
@@ -539,9 +542,8 @@ mod tests {
                 stopTestEvent
             ));
             dbg!(testTime);
-        
-            let mut test_result_image_vec = Vec::with_capacity(rgba_byte_size);
-            test_result_image_vec.resize(rgba_byte_size, 0_u8);
+
+            let mut test_result_image_vec = vec![0; rgba_byte_size];
             check_cuda!(cuMemcpyDtoH_v2(
                 test_result_image_vec.as_mut_ptr() as *mut c_void,
                 image_device_addr,
