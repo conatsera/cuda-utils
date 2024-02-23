@@ -28,40 +28,14 @@ __device__ constexpr unsigned int calculate_block_count()
 
 constexpr const unsigned int kBlockCount = calculate_block_count();
 
-__device__ constexpr unsigned int count_trailing_zeros(unsigned int num)
-{
-    for (int i = 31; i >= 0; i--)
-    {
-        if (num & (1 << i) == (1 << i))
-        {
-            return 31 - i;
-        }
-    }
-    return 0;
-}
-
 __device__ constexpr unsigned int calculate_optimal_block_size(const unsigned int size)
 {
-    const unsigned int pow2_divisor = count_trailing_zeros(size);
-    if (pow2_divisor < 2)
+    for (int i = 256; i > 0; i--)
     {
-        int i = 1023;
-        while (i > 0)
+        if (size % i == 0)
         {
-            if (size % i == 0)
-            {
-                return i;
-            }
-            i -= 1;
+            return i;
         }
-    }
-    else if (pow2_divisor < 10)
-    {
-        return 1 << pow2_divisor;
-    }
-    else
-    {
-        return 1024;
     }
 }
 
@@ -82,36 +56,38 @@ struct BlockMoves
     BlockMove moves[kBlockCount];
 };
 
-__global__ void rgb_to_rgba_shift_segment(unsigned char *__restrict__ image_bytes, const __grid_constant__ unsigned int start_index)
+__global__ void rgb_to_rgba_shift_segment(unsigned char* __restrict__ image_bytes, const __grid_constant__ unsigned int start_index)
 {
-    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x + start_index;
-    const unsigned int rgb_base_addr = index * 3;
-    const unsigned int rgba_base_addr = index * 4;
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x + start_index;
+    unsigned int rgb_base_addr = index * 3;
+    unsigned int rgba_base_addr = index * 4;
 
-    const uchar4 rgba_pixel = make_uchar4(image_bytes[rgb_base_addr], image_bytes[rgb_base_addr + 1], image_bytes[rgb_base_addr + 2], 0);
+    uchar4 rgba_pixel = make_uchar4(image_bytes[rgb_base_addr], image_bytes[rgb_base_addr + 1], image_bytes[rgb_base_addr + 2], 0);
     memcpy(&image_bytes[rgba_base_addr], &rgba_pixel, 4);
 }
 
-__global__ void rgb_to_rgba_shift_segment_final(unsigned char *__restrict__ image_bytes)
+__global__ void rgb_to_rgba_shift_segment_final(unsigned char* __restrict__ image_bytes)
 {
-    const unsigned int index = threadIdx.x;
-    const unsigned int rgb_base_addr = index * 3;
+    unsigned int index = threadIdx.x;
+    unsigned int rgb_base_addr = index * 3;
 
-    const uchar4 rgba_pixel = make_uchar4(image_bytes[rgb_base_addr], image_bytes[rgb_base_addr + 1], image_bytes[rgb_base_addr + 2], 0);
+    uchar4 rgba_pixel = make_uchar4(image_bytes[rgb_base_addr], image_bytes[rgb_base_addr + 1], image_bytes[rgb_base_addr + 2], 0);
 
     __syncthreads();
 
-    const unsigned int rgba_base_addr = index * 4;
+    unsigned int rgba_base_addr = index * 4;
     memcpy(&image_bytes[rgba_base_addr], &rgba_pixel, 4);
 }
 
 extern "C" __global__ void rgb_to_rgba(unsigned char *__restrict__ image_bytes)
 {
-    constexpr const auto block_moves = BlockMoves();
+    constexpr auto block_moves = BlockMoves();
+
 #pragma unroll
     for (int i = 0; i < kBlockCount; i++)
     {
-        const unsigned int block_size = block_moves.moves[i].block_size;
+        unsigned int block_size = block_moves.moves[i].block_size;
+        //printf("%u %u %u\n", block_moves.moves[i].size, block_size, block_moves.moves[i].position);
         rgb_to_rgba_shift_segment<<<block_moves.moves[i].size / block_size, block_size>>>(image_bytes, block_moves.moves[i].position);
     }
 
